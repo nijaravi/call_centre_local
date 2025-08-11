@@ -10,6 +10,7 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+
 // PostgreSQL Connection
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -47,29 +48,6 @@ app.get("/api/calls-today/:agentId", async (req, res) => {
   }
 });
 
-// app.get("/api/weekly-volume/:agentId", async (req, res) => {
-//   const { agentId } = req.params;
-//   try {
-//     const result = await pool.query(
-//       `SELECT 
-//       TO_CHAR(DATE(analyzed_at), 'YYYY-MM-DD') AS day,
-//       COUNT(*)::INTEGER AS count
-//     FROM vocalytics.call_sentiments cs
-//     JOIN vocalytics.calls c ON cs.call_id = c.call_id
-//     WHERE c.user_id = $1
-//       AND analyzed_at >= CURRENT_DATE - INTERVAL '7 days'
-//     GROUP BY day
-//     ORDER BY day`,
-//       [agentId]
-//     );
-//     console.log("reslut", result);
-//     res.json(result.rows);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send("Server error");
-//   }
-// });
-
 
 app.get('/api/weekly-volume/:agentId', (req, res) => {
   const agentId = req.params.agentId;
@@ -95,149 +73,172 @@ app.get('/api/weekly-volume/:agentId', (req, res) => {
 });
 
 
-app.get("/api/performance-score/:agentId", async (req, res) => {
+// Performance score
+app.get("/api/performance-score/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT ROUND(AVG(CASE 
-          WHEN cs.overall_sentiment = 'positive' THEN 1.0 
-          WHEN cs.overall_sentiment = 'neutral' THEN 0.5 
-          ELSE 0 END), 2) AS score 
-         FROM vocalytics.calls c 
-         JOIN vocalytics.call_sentiments cs ON c.call_id = cs.call_id 
-         WHERE c.user_id = $1 AND analyzed_at >= date_trunc('month', CURRENT_DATE)`,
-      [agentId]
-    );
-    res.json({ score: result.rows[0].score });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    SELECT ROUND(AVG(CASE 
+        WHEN cs.overall_sentiment = 'positive' THEN 1.0 
+        WHEN cs.overall_sentiment = 'neutral' THEN 0.5 
+        ELSE 0 END), 2) AS score
+    FROM calls c
+    JOIN call_sentiments cs ON c.call_id = cs.call_id
+    WHERE c.user_id = ?
+      AND DATE(cs.analyzed_at) >= DATE('now', 'start of month')
+  `;
+
+  db.get(sql, [agentId], (err, row) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ score: row ? row.score : null });
+  });
 });
 
-app.get("/api/leaderboard-rank/:agentId", async (req, res) => {
+// Leaderboard rank
+app.get("/api/leaderboard-rank/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `WITH scores AS (
-            SELECT c.user_id, COUNT(*) AS call_volume
-            FROM vocalytics.calls c
-            JOIN vocalytics.call_sentiments cs ON c.call_id = cs.call_id
-            WHERE cs.analyzed_at >= date_trunc('month', CURRENT_DATE)
-            GROUP BY c.user_id
-            ),
-            ranked AS (
-            SELECT user_id, RANK() OVER (ORDER BY call_volume DESC) AS rank
-            FROM scores
-            )
-            SELECT rank FROM ranked WHERE user_id = $1;`,
-      [agentId]
-    );
-    console.log("rank", result.rows[0].rank);
-    res.json({ rank: result.rows[0].rank });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    WITH scores AS (
+        SELECT c.user_id, COUNT(*) AS call_volume
+        FROM calls c
+        JOIN call_sentiments cs ON c.call_id = cs.call_id
+        WHERE DATE(cs.analyzed_at) >= DATE('now', 'start of month')
+        GROUP BY c.user_id
+    ),
+    ranked AS (
+        SELECT user_id, RANK() OVER (ORDER BY call_volume DESC) AS rank
+        FROM scores
+    )
+    SELECT rank FROM ranked WHERE user_id = ?
+  `;
+
+  db.get(sql, [agentId], (err, row) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ rank: row ? row.rank : null });
+  });
 });
 
-app.get("/api/sentiment-distribution/:agentId", async (req, res) => {
+
+// 1. Sentiment distribution
+app.get("/api/sentiment-distribution/:agentId", (req, res) => {
   const { agentId } = req.params;
-  console.log("supervisor_id", agentId);
-  try {
-    const result = await pool.query(
-      `SELECT 
+
+  const sql = `
+    SELECT 
       cs.overall_sentiment,
-      COUNT(*)::INTEGER AS count
-  FROM vocalytics.call_sentiments cs
-  JOIN vocalytics.calls c ON cs.call_id = c.call_id
-  WHERE c.user_id = $1
-  GROUP BY cs.overall_sentiment
-  ORDER BY cs.overall_sentiment;`,
-      [agentId]
-    );
-    res.json({ sentiment: result.rows });
-  } catch (err) {
-    console.error("Error fetching sentiment distribution:", err);
-    res.status(500).send("Server error");
-  }
+      COUNT(*) AS count
+    FROM call_sentiments cs
+    JOIN calls c ON cs.call_id = c.call_id
+    WHERE c.user_id = ?
+    GROUP BY cs.overall_sentiment
+    ORDER BY cs.overall_sentiment
+  `;
+
+  db.all(sql, [agentId], (err, rows) => {
+    if (err) {
+      console.error("Error fetching sentiment distribution:", err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ sentiment: rows });
+  });
 });
 
-app.get("/api/calls-by-tag/:agentId", async (req, res) => {
+// 2. Calls by tag (SQLite: parse JSON from TEXT column)
+app.get("/api/calls-by-tag/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT tag, COUNT(*) ::INTEGER AS count
-      FROM (
-        SELECT jsonb_array_elements_text(conversation_tags) AS tag 
-        FROM vocalytics.call_sentiments 
-        JOIN vocalytics.calls USING (call_id) 
-        WHERE user_id = $1
-      ) t 
-      GROUP BY tag
-      order by count DESC
-      LIMIT 5`,
-      [agentId]
-    );
-    res.json({ calls: result.rows });
-  } catch (err) {
-    console.error("Error fetching calls by tag:", err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    SELECT tag, COUNT(*) AS count
+    FROM (
+      SELECT json_each.value AS tag
+      FROM call_sentiments
+      JOIN calls USING (call_id)
+      JOIN json_each(call_sentiments.conversation_tags)
+      WHERE user_id = ?
+    ) t
+    GROUP BY tag
+    ORDER BY count DESC
+    LIMIT 5
+  `;
+
+  db.all(sql, [agentId], (err, rows) => {
+    if (err) {
+      console.error("Error fetching calls by tag:", err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ calls: rows });
+  });
 });
 
-app.get("/api/recent-escalations/:agentId", async (req, res) => {
+// 3. Recent escalations
+app.get("/api/recent-escalations/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT e.call_id, e.escalation_reason, e.possible_action, e.created_at 
-         FROM vocalytics.escalations e 
-         WHERE agent_id = $1 
-         ORDER BY created_at DESC 
-         LIMIT 4`,
-      [agentId]
-    );
-    res.json({ escalations: result.rows });
-  } catch (err) {
-    console.error("Error fetching recent escalations:", err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    SELECT e.call_id, e.escalation_reason, e.possible_action, e.created_at
+    FROM escalations e
+    WHERE e.agent_id = ?
+    ORDER BY e.created_at DESC
+    LIMIT 4
+  `;
+
+  db.all(sql, [agentId], (err, rows) => {
+    if (err) {
+      console.error("Error fetching recent escalations:", err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ escalations: rows });
+  });
 });
 
-app.get("/api/recent-calls/:agentId", async (req, res) => {
+// 4. Recent calls
+app.get("/api/recent-calls/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT c.call_id, c.duration_sec, c.language, cs.overall_sentiment, cs.analyzed_at 
-         FROM vocalytics.calls c 
-         JOIN vocalytics.call_sentiments cs ON c.call_id = cs.call_id 
-         WHERE c.user_id = $1 
-         ORDER BY cs.analyzed_at DESC 
-         LIMIT 5`,
-      [agentId]
-    );
-    res.json({ calls: result.rows });
-  } catch (err) {
-    console.error("Error fetching recent calls:", err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    SELECT c.call_id, c.duration_sec, c.language, cs.overall_sentiment, cs.analyzed_at
+    FROM calls c
+    JOIN call_sentiments cs ON c.call_id = cs.call_id
+    WHERE c.user_id = ?
+    ORDER BY cs.analyzed_at DESC
+    LIMIT 5
+  `;
+
+  db.all(sql, [agentId], (err, rows) => {
+    if (err) {
+      console.error("Error fetching recent calls:", err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ calls: rows });
+  });
 });
 
-app.get("/api/agent-insights/:agentId", async (req, res) => {
+
+app.get("/api/agent-insights/:agentId", (req, res) => {
   const { agentId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT user_id, strengths, area_of_improvement, action_items
-       FROM vocalytics.agents_ai_insights
-       WHERE user_id = $1`,
-      [agentId]
-    );
-    res.json({ insights: result.rows });
-  } catch (err) {
-    console.error("Error fetching agent insights:", err);
-    res.status(500).send("Server error");
-  }
+
+  const sql = `
+    SELECT user_id, strengths, area_of_improvement, action_items
+    FROM agents_ai_insights
+    WHERE user_id = ?
+  `;
+
+  db.all(sql, [agentId], (err, rows) => {
+    if (err) {
+      console.error("Error fetching agent insights:", err);
+      return res.status(500).send("Server error");
+    }
+    res.json({ insights: rows });
+  });
 });
+
 
 // supervisor
 
